@@ -1,269 +1,252 @@
-# model.py
-import math
-from dataclasses import dataclass
-from typing import Optional, Tuple
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn import RMSNorm
+import math
 
-from tokenizer import Tokenizer
+# Try importing Liger Kernel
+try:
+    from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
+    HAS_LIGER = True
+except ImportError:
+    HAS_LIGER = False
+    print("Liger Kernel not found. Falling back to standard CrossEntropy.")
 
-
-# -------------------------
-# Config
-# -------------------------
-
-@dataclass
-class ModelConfig:
-    d_model: int = 384
-    n_layers: int = 6
-    n_heads: int = 8
-
-    # latent attention specific
-    latent_dim: int = 64
-    attn_dropout: float = 0.0
-    dropout: float = 0.0
-
-    block_size: int = 128
-
-    # filled from tokenizer
-    vocab_size: int = 0
-    pad_id: int = 0
-    bos_id: Optional[int] = None
-    eos_id: Optional[int] = None
-
-
-
-class TokenPositionalEmbedding(nn.Module):
-    def __init__(self, cfg: ModelConfig):
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
-        assert cfg.vocab_size > 0, "vocab_size must be set in ModelConfig"
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
 
-        self.block_size = cfg.block_size
-        self.token_embed = nn.Embedding(cfg.vocab_size, cfg.d_model)
-        self.pos_embed = nn.Embedding(cfg.block_size, cfg.d_model)
+    def forward(self, x):
+        var = torch.mean(x ** 2, dim=-1, keepdim=True)
+        x = x * torch.rsqrt(var + self.eps)
+        return x * self.weight
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """
-        input_ids: [B, T] int64
-        returns:   [B, T, d_model]
-        """
-        bsz, seqlen = input_ids.shape
-        device = input_ids.device
+def apply_rotary_emb(xq, xk, freq_cis):
+    # A simplified RoPE implementation
+    # Reshape for broadcasting: [B, Seq, Heads, Dim/2, 2]
+    xq_out = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_out = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    freq_cis = freq_cis[:xq.shape[1]] # Slice to seq len
+    
+    # Rotate
+    xq_out = torch.view_as_real(xq_out * freq_cis).flatten(3)
+    xk_out = torch.view_as_real(xk_out * freq_cis).flatten(3)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
 
-        if seqlen > self.block_size:
-            raise ValueError(
-                f"Sequence length {seqlen} > block_size {self.block_size}"
-            )
-
-        tok = self.token_embed(input_ids)  # [B, T, d_model]
-
-        pos_ids = torch.arange(seqlen, device=device).unsqueeze(0)  # [1, T]
-        pos = self.pos_embed(pos_ids)                               # [1, T, d_model]
-
-        return tok + pos
-
-
-
-
-class LatentAttention(nn.Module):
+class MLA(nn.Module):
     """
-    Multi-head latent attention:
-
-    - compresses hidden states into a lower-dimensional "latent" space
-      before building keys/values (W_d -> W_k, W_v),
-    - keeps queries in the full d_model space (W_q),
-    - then uses standard scaled dot-product attention per head.
+    Multi-Head Latent Attention (DeepSeek V2/V3 Style)
+    Compresses KV into a latent vector to reduce VRAM usage for massive contexts.
+    Includes QK Norm for stability.
     """
-
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, args):
         super().__init__()
-        assert cfg.d_model % cfg.n_heads == 0, "d_model must be divisible by n_heads"
+        self.dim = args.dim
+        self.n_heads = args.n_heads
+        self.head_dim = args.dim // args.n_heads
+        self.kv_lora_rank = args.kv_lora_rank
+        
+        # Q Projection (Standard or Compressed)
+        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
+        
+        # MLA: Compress KV into a low-rank latent vector
+        self.w_kv_down = nn.Linear(args.dim, args.kv_lora_rank, bias=False)
+        # Project latent up to generate Keys and Values
+        self.w_kv_up = nn.Linear(args.kv_lora_rank, 2 * (args.n_heads * self.head_dim), bias=False)
+        
+        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
+        
+        # QK Norm (Crucial for Muon/MoE stability)
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
+        
+        # Precompute RoPE frequencies
+        self.register_buffer("freqs_cis", self.precompute_freqs_cis(args.dim // args.n_heads, args.max_seq_len))
 
-        self.d_model = cfg.d_model
-        self.n_heads = cfg.n_heads
-        self.head_dim = cfg.d_model // cfg.n_heads
-        self.latent_dim = cfg.latent_dim
+    def precompute_freqs_cis(self, dim: int, end: int, theta: float = 10000.0):
+        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+        t = torch.arange(end, device=freqs.device)
+        freqs = torch.outer(t, freqs).float()
+        freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+        return freqs_cis
 
-        # project to latent space, then back to full space for K/V
-        self.w_d = nn.Linear(self.d_model, self.latent_dim, bias=False)
-        self.w_k = nn.Linear(self.latent_dim, self.d_model, bias=False)
-        self.w_v = nn.Linear(self.latent_dim, self.d_model, bias=False)
+    def forward(self, x, mask=None):
+        B, T, C = x.shape
+        
+        # 1. Query Generation
+        xq = self.wq(x)
+        xq = xq.view(B, T, self.n_heads, self.head_dim)
+        
+        # 2. MLA: KV Generation via Compression
+        latent_kv = self.w_kv_down(x) # [B, T, kv_lora_rank]
+        kv = self.w_kv_up(latent_kv)  # [B, T, 2 * n_heads * head_dim]
+        kv = kv.view(B, T, 2, self.n_heads, self.head_dim)
+        xk, xv = kv.unbind(2)
+        
+        # 3. QK Norm (Stability Trick)
+        xq = self.q_norm(xq)
+        xk = self.k_norm(xk)
+        
+        # 4. RoPE
+        xq, xk = apply_rotary_emb(xq, xk, self.freqs_cis)
+        
+        # 5. Attention
+        # Flash Attention is highly recommended here
+        out = F.scaled_dot_product_attention(
+            xq.transpose(1, 2), # [B, H, T, D]
+            xk.transpose(1, 2),
+            xv.transpose(1, 2),
+            is_causal=True
+        )
+        
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
+        return self.wo(out)
 
-        # queries stay in full d_model space
-        self.w_q = nn.Linear(self.d_model, self.d_model, bias=False)
-
-        self.dropout = nn.Dropout(cfg.attn_dropout)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,  # [B, T] with 1 for valid tokens
-    ) -> torch.Tensor:
-        """
-        x:    [B, T, d_model]
-        mask: [B, T] or None
-
-        returns: [B, T, d_model]
-        """
-        B, T, _ = x.shape
-        device = x.device
-
-        # 1) build queries
-        q = self.w_q(x)  # [B, T, d_model]
-
-        # 2) compress to latent space and reconstruct K,V
-        latent = self.w_d(x)          # [B, T, latent_dim]
-        k_full = self.w_k(latent)     # [B, T, d_model]
-        v_full = self.w_v(latent)     # [B, T, d_model]
-
-        # 3) reshape into heads
-        def split_heads(t: torch.Tensor) -> torch.Tensor:
-            # [B, T, d_model] -> [B, n_heads, T, head_dim]
-            return t.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-
-        q = split_heads(q)      # [B, H, T, Hd]
-        k = split_heads(k_full) # [B, H, T, Hd]
-        v = split_heads(v_full) # [B, H, T, Hd]
-
-        # 4) scaled dot-product attention with causal mask
-        attn_scores = q @ k.transpose(-2, -1)  # [B, H, T, T]
-        attn_scores = attn_scores / math.sqrt(self.head_dim)
-
-        # causal mask: only attend to previous / current positions
-        causal = torch.tril(torch.ones(T, T, device=device, dtype=torch.bool))
-        attn_scores = attn_scores.masked_fill(~causal, float("-inf"))
-
-        # optional key padding mask
-        if mask is not None:
-            # mask: [B, T] with 1 for real tokens, 0 for pad
-            key_mask = mask[:, None, None, :].bool()  # [B, 1, 1, T]
-            attn_scores = attn_scores.masked_fill(~key_mask, float("-inf"))
-
-        attn_probs = F.softmax(attn_scores, dim=-1)
-        attn_probs = self.dropout(attn_probs)
-
-        out = attn_probs @ v  # [B, H, T, Hd]
-
-        # 5) merge heads back
-        out = out.transpose(1, 2).contiguous().view(B, T, self.d_model)
-        return out
-
-
-
-class MHLA(nn.Module):
+class DeepSeekMoE(nn.Module):
     """
-    Multi-Head Latent Attention block:
-    latent attention + output projection + dropout.
+    Shared + Routed Experts (DeepSeek V3 Style).
+    Features:
+    - A set of 'Shared' experts that always activate (captures common knowledge).
+    - A set of 'Routed' experts selected by TopK.
+    - Auxiliary Loss for load balancing.
     """
-
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, args):
         super().__init__()
-        self.attn = LatentAttention(cfg)
-        self.out_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
-        self.dropout = nn.Dropout(cfg.dropout)
+        self.num_experts = args.num_experts
+        self.top_k = args.top_k
+        self.num_shared = args.num_shared_experts
+        
+        # Gating (Router)
+        self.gate = nn.Linear(args.dim, args.num_experts, bias=False)
+        
+        # Shared Experts (MLP)
+        self.shared_experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(args.dim, args.expert_hidden_dim, bias=False),
+                nn.SiLU(),
+                nn.Linear(args.expert_hidden_dim, args.dim, bias=False)
+            ) for _ in range(self.num_shared)
+        ])
+        
+        # Routed Experts (MLP)
+        self.routed_experts = nn.ModuleList([
+             nn.Sequential(
+                nn.Linear(args.dim, args.expert_hidden_dim, bias=False),
+                nn.SiLU(),
+                nn.Linear(args.expert_hidden_dim, args.dim, bias=False)
+            ) for _ in range(self.num_experts)
+        ])
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        x:    [B, T, d_model]
-        mask: [B, T] or None
-        """
-        h = self.attn(x, mask=mask)     # [B, T, d_model]
-        h = self.out_proj(h)            # [B, T, d_model]
-        h = self.dropout(h)
-        return h
+    def forward(self, x):
+        # x: [B, T, C]
+        original_shape = x.shape
+        x_flat = x.view(-1, original_shape[-1])
+        
+        # 1. Shared Experts Forward
+        shared_out = sum(expert(x_flat) for expert in self.shared_experts)
+        
+        # 2. Router Forward
+        logits = self.gate(x_flat) # [Tokens, Num_Experts]
+        probs = F.softmax(logits, dim=-1)
+        
+        # Select TopK
+        top_k_weights, top_k_indices = torch.topk(probs, self.top_k, dim=-1)
+        top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True) # Re-normalize
+        
+        # 3. Calculate Aux Loss (Load Balancing)
+        # target_probs usually 1/N
+        # This is a simplified Load Balancing loss
+        density_1 = probs.mean(dim=0)
+        density_1_proxy = logits.mean(dim=0) # Simplified proxy
+        aux_loss = (density_1 * density_1_proxy).sum() * self.num_experts
+        
+        # 4. Routed Experts Forward
+        # Naive for-loop implementation (Optimized kernels use sparse scatter/gather)
+        routed_out = torch.zeros_like(x_flat)
+        
+        # This loop is slow in python, usually you use Triton kernels here.
+        # For training script demo, we stick to masked implementation or iterating tokens
+        # A simple approach for readability:
+        
+        # Iterate over k selected experts
+        final_out = torch.zeros_like(x_flat)
+        
+        # Vectorized Scatter-Gather approach
+        # (For production, use MegaBlocks or Triton)
+        flat_indices = top_k_indices.view(-1)
+        flat_weights = top_k_weights.view(-1)
+        
+        # Doing a very naive implementation for compatibility:
+        for k in range(self.top_k):
+            indices_k = top_k_indices[:, k]
+            weights_k = top_k_weights[:, k]
+            
+            for e in range(self.num_experts):
+                # Find tokens assigned to expert e at rank k
+                mask = (indices_k == e)
+                if mask.any():
+                    expert_input = x_flat[mask]
+                    expert_output = self.routed_experts[e](expert_input)
+                    final_out[mask] += expert_output * weights_k[mask].unsqueeze(-1)
 
+        total_out = shared_out + final_out
+        return total_out.view(*original_shape), aux_loss
 
-class DecoderBlock(nn.Module):
-    """
-    Single decoder block with:
-
-        x = x + MHLA(LN(x))
-
-    ADD MoE / FFN 
-    """
-
-    def __init__(self, cfg: ModelConfig):
+class Block(nn.Module):
+    def __init__(self, args):
         super().__init__()
-        self.norm_attn = RMSNorm(cfg.d_model)
-        self.attn = MHLA(cfg)
+        self.attn_norm = RMSNorm(args.dim)
+        self.attn = MLA(args) # Multi-Head Latent Attention
+        self.ffn_norm = RMSNorm(args.dim)
+        self.moe = DeepSeekMoE(args) # Shared+Routed MoE
+        self.dropout = nn.Dropout(args.dropout)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        x:    [B, T, d_model]
-        mask: [B, T] or None
-        """
-        h = self.norm_attn(x)
-        h = self.attn(h, mask=mask)
-        return x + h  # residual
+    def forward(self, x):
+        # Attention Residual
+        h = x + self.dropout(self.attn(self.attn_norm(x)))
+        
+        # MoE Residual
+        moe_out, aux_loss = self.moe(self.ffn_norm(h))
+        out = h + self.dropout(moe_out)
+        return out, aux_loss
 
-class TinyLatentLM(nn.Module):
-    """
-    Decoder-only language model with:
-
-    - token + positional embeddings
-    - N layers of (pre-norm + MHLA + residual)
-    - final RMSNorm + LM head
-
-    MoE / FFN will be added later.
-    """
-
-    def __init__(self, cfg: ModelConfig):
+class DeepSeekV3(nn.Module):
+    def __init__(self, args):
         super().__init__()
-        self.cfg = cfg
+        self.args = args
+        self.embedding = nn.Embedding(args.vocab_size, args.dim)
+        self.pos_embeddings = nn.Embedding(args.max_seq_len, args.dim) # Placeholder for simplicity
+        
+        self.layers = nn.ModuleList([Block(args) for _ in range(args.n_layers)])
+        self.norm = RMSNorm(args.dim)
+        self.linear_layer = nn.Linear(args.dim, args.vocab_size, bias=False)
+        
+        # Initialize Liger Loss if available
+        if args.use_liger and HAS_LIGER:
+            self.le_loss = LigerFusedLinearCrossEntropyLoss()
+        
+        # Weight tying
+        self.embedding.weight = self.linear_layer.weight
+        
+        self.last_aux_loss = 0.0
 
-        self.embed = TokenPositionalEmbedding(cfg)
-        self.layers = nn.ModuleList(DecoderBlock(cfg) for _ in range(cfg.n_layers))
-        self.norm_out = RMSNorm(cfg.d_model)
-        self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
-
-        # weight tying
-        self.lm_head.weight = self.embed.token_embed.weight
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        input_ids: [B, T] int64
-        mask:      [B, T] or None
-        returns:   [B, T, vocab_size] logits
-        """
-        x = self.embed(input_ids)  # [B, T, d_model]
-
+    def forward(self, input_ids, mask=None):
+        B, T = input_ids.shape
+        x = self.embedding(input_ids)
+        
+        total_aux_loss = 0.0
         for layer in self.layers:
-            x = layer(x, mask=mask)
-
-        x = self.norm_out(x)
-        logits = self.lm_head(x)  # [B, T, V]
-        return logits
-
-
-
-def build_model_and_tokenizer() -> Tuple[TinyLatentLM, ModelConfig, object]:
-    # 1) load tokenizer
-    tok = Tokenizer().get()
-
-    # 2) config with tokenizer-dependent fields
-    cfg = ModelConfig()
-    cfg.vocab_size = len(tok)
-    cfg.pad_id = tok.pad_token_id
-    cfg.bos_id = getattr(tok, "bos_token_id", None)
-    cfg.eos_id = getattr(tok, "eos_token_id", None)
-
-    # 3) build model
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = TinyLatentLM(cfg).to(device)
-
-    return model, cfg, tok
+            x, aux_loss = layer(x)
+            total_aux_loss += aux_loss
+            
+        x = self.norm(x)
+        
+        # Store aux loss for the training loop to access
+        self.last_aux_loss = total_aux_loss
+        
+        if self.args.use_liger and self.training:
+            # Return embeddings for Liger fused loss
+            return x 
+            
+        return self.linear_layer(x)
