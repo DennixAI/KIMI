@@ -4,43 +4,18 @@ import torch.nn.functional as F
 import math
 import tqdm 
 import os
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+import wandb
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
+
+# Muon
 from muon import MuonWithAuxAdam
+
+# Local
 from config import ModelArgs, get_args
 from model import DeepSeekV3
 from data import prepare_dataset, initialize_tokenizer
 from inference import topk_sampling, save_text
-
-
-def save_training_plot(metrics, save_path):
-    if metrics is None or not metrics["steps"]:
-        return
-
-    steps = metrics["steps"]
-    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-
-    axes[0].plot(steps, metrics["train_loss"], label="Train Loss", color="tab:blue")
-    axes[0].plot(steps, metrics["aux_loss"], label="Aux Loss", color="tab:orange")
-    axes[0].set_ylabel("Loss")
-    axes[0].legend(loc="upper right")
-    axes[0].grid(True, linestyle="--", alpha=0.3)
-
-    axes[1].plot(steps, metrics["lr"], label="Learning Rate", color="tab:green")
-    axes[1].set_ylabel("Learning Rate")
-    axes[1].set_xlabel("Step")
-    axes[1].grid(True, linestyle="--", alpha=0.3)
-
-    ax2 = axes[1].twinx()
-    ax2.plot(steps, metrics["tokens"], label="Tokens", color="tab:red", alpha=0.5)
-    ax2.set_ylabel("Tokens")
-
-    fig.tight_layout()
-    fig.savefig(save_path)
-    plt.close(fig)
 
 def setup_ddp():
     dist.init_process_group(backend='nccl')
@@ -67,10 +42,12 @@ def get_lr(it, model_args):
 
 def train():
     args = get_args()
-    model_args = ModelArgs() # Load defaults, then override if needed
+    model_args = ModelArgs()
     
+    # Tokenizer
     tokenizer = initialize_tokenizer(model_args.hf_token)
     
+    # DDP
     use_ddp = 'RANK' in os.environ or model_args.use_ddp
     if use_ddp:
         local_rank, world_size, rank, device = setup_ddp()
@@ -80,17 +57,13 @@ def train():
         world_size = 1
         local_rank = 0
         
-    metrics_history = None
     if rank == 0:
-        print(f"Training DeepSeek-V3-Like Model on {device}")
-        metrics_history = {
-            "steps": [],
-            "train_loss": [],
-            "aux_loss": [],
-            "lr": [],
-            "tokens": []
-        }
+        print(f"Training on {device} | World Size: {world_size}")
+        print(f"Dataset: {model_args.dataset}")
+        print(f"Vocab Size: {model_args.vocab_size} (Llama-3)")
+        wandb.init(project=model_args.wandb_project, name=model_args.wandb_run_name, config=vars(model_args))
     
+    # Model
     model = DeepSeekV3(model_args).to(device)
     
     if use_ddp:
@@ -98,118 +71,119 @@ def train():
     
     base_model = model.module if use_ddp else model
     
-    # --- OPTIMIZER GROUPING (CRITICAL FOR MUON) ---
-    # 1. Filter params that are 2D (internal layers) for Muon
-    # 2. Biases and Norms get AdamW with 0 weight decay
-    # 3. Embeddings/Head get AdamW with weight decay
-    
+    # Optimizer Groups
     hidden_weights = []
     norm_bias_params = []
     non_hidden_params = []
     
     for name, param in base_model.named_parameters():
-        if not param.requires_grad:
-            continue
-            
-        # Embedding and Head -> AdamW standard
+        if not param.requires_grad: continue
         if "embedding" in name or "linear_layer" in name:
             non_hidden_params.append(param)
-        # LayerNorm, RMSNorm, Biases -> AdamW (No Decay)
         elif param.ndim < 2 or "norm" in name or "bias" in name:
             norm_bias_params.append(param)
-        # Internal Projections (Attn, MLP, Experts) -> Muon
         else:
             hidden_weights.append(param)
 
     param_groups = [
-        # Muon Group (High LR, Orthogonal Updates)
         {'params': hidden_weights, 'use_muon': True, 'lr': 0.02, 'weight_decay': 0.01},
-        # Standard AdamW Group
         {'params': non_hidden_params, 'use_muon': False, 'lr': model_args.max_lr, 'weight_decay': model_args.weight_decay_optim},
-        # No Decay Group
         {'params': norm_bias_params, 'use_muon': False, 'lr': model_args.max_lr, 'weight_decay': 0.0}
     ]
     
     optimizer = MuonWithAuxAdam(param_groups)
-    
-    # Compile usually helps with MLA/RoPE
     model = torch.compile(model)
     
-    dataloader = prepare_dataset('train', device, model_args.batch_size, use_ddp=use_ddp)
-    train_dataloader = iter(dataloader)
+    # Data Loaders
+    train_dataloader = prepare_dataset('train', device, model_args.batch_size, use_ddp=use_ddp)
+    train_iterator = iter(train_dataloader)
     
+    # Create a separate iterator for validation (just grabbing a fresh batch from stream)
+    # Note: For strict validation, you'd want a separate held-out dataset shard.
     val_dataloader = prepare_dataset('val', device, model_args.batch_size, use_ddp=use_ddp)
-    
-    token_count = 0
-    
-    # Helper for Liger
+    val_iterator = iter(val_dataloader)
+
+    # Liger Loss Helper
     def compute_loss(output, targets, model_ref):
         if model_args.use_liger and hasattr(model_ref, 'le_loss'):
-            # Output is strictly the decoder output (hidden state), not logits
-            # We fuse the linear head + cross entropy here
-            # Reshape: [B*T, D]
             decoder_out_flat = output.contiguous().view(-1, model_args.dim)
             targets_flat = targets.contiguous().view(-1)
             return model_ref.le_loss(model_ref.linear_layer.weight, decoder_out_flat, targets_flat)
         else:
-            # Output is logits: [B, T, Vocab]
             logits_flat = output.contiguous().view(-1, model_args.vocab_size)
             targets_flat = targets.contiguous().view(-1)
             return F.cross_entropy(logits_flat, targets_flat, ignore_index=tokenizer.pad_token_id)
 
+    @torch.no_grad()
+    def estimate_loss():
+        model.eval()
+        losses = []
+        for _ in range(model_args.eval_iters):
+            try:
+                batch = next(val_iterator)
+            except StopIteration:
+                break
+            idx, targets = batch['input_ids'].to(device), batch['labels'].to(device)
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                # We ignore aux loss during validation, just check perplexity
+                out = base_model(idx)
+                if model_args.use_liger and hasattr(base_model, 'le_loss'):
+                     # Liger returns loss directly if using fuse
+                     # But our model forward returns hidden states for liger
+                     l = compute_loss(out, targets, base_model)
+                else:
+                     l = compute_loss(out, targets, base_model)
+            losses.append(l.item())
+        
+        avg_loss = torch.tensor(losses).mean().to(device)
+        if use_ddp:
+            dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
+        model.train()
+        return avg_loss.item()
+
     model.train()
-    
     if rank == 0:
         pbar = tqdm.tqdm(range(model_args.total_iters))
     
+    token_count = 0
+    accumulated_loss = 0.0
+    
     for step in range(model_args.total_iters):
+        # LR Schedule
         lr = get_lr(step, model_args)
-        # Update LR for Adam groups (indices 1 and 2)
-        # Muon (index 0) typically keeps constant LR, but can schedule if supported
-        for i in range(1, 3):
-            optimizer.param_groups[i]['lr'] = lr
+        for i in range(1, 3): optimizer.param_groups[i]['lr'] = lr
             
         optimizer.zero_grad(set_to_none=True)
         accumulated_loss = 0.0
         
         for micro_step in range(model_args.gradient_accumulation_steps):
             try:
-                batch = next(train_dataloader)
+                batch = next(train_iterator)
             except StopIteration:
-                train_dataloader = iter(dataloader)
-                batch = next(train_dataloader)
+                train_iterator = iter(train_dataloader)
+                batch = next(train_iterator)
                 
-            idx = batch['input_ids'].to(device)
-            targets = batch['labels'].to(device)
+            idx, targets = batch['input_ids'].to(device), batch['labels'].to(device)
             token_count += idx.numel()
             
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 output = model(idx)
-                
-                # Access the underlying model to get aux_loss and reference for liger
                 ref_model = model.module if use_ddp else model
                 
-                # 1. Main Task Loss
                 cls_loss = compute_loss(output, targets, ref_model)
-                
-                # 2. Auxiliary Load Balancing Loss (Critical for MoE)
                 aux_loss = ref_model.last_aux_loss
                 
-                # Total Loss
                 loss = cls_loss + (model_args.aux_loss_coef * aux_loss)
                 
-            # Scale loss
             loss = loss / model_args.gradient_accumulation_steps
             loss.backward()
             accumulated_loss += loss.item()
         
-        # Sync loss for logging
         if use_ddp:
             loss_tensor = torch.tensor(accumulated_loss, device=device)
             dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
             accumulated_loss = loss_tensor.item()
             
-        # Clip Gradients
         if model_args.clip > 0.0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), model_args.clip)
             
@@ -218,31 +192,16 @@ def train():
         if rank == 0:
             pbar.update(1)
             pbar.set_description(f"Loss: {accumulated_loss:.4f}")
+            wandb.log({"train_loss": accumulated_loss, "lr": lr, "tokens": token_count})
             
-            aux_loss_value = aux_loss.item() if isinstance(aux_loss, torch.Tensor) else aux_loss
-            if metrics_history is not None:
-                metrics_history["steps"].append(step)
-                metrics_history["train_loss"].append(accumulated_loss)
-                metrics_history["aux_loss"].append(aux_loss_value)
-                metrics_history["lr"].append(lr)
-                metrics_history["tokens"].append(token_count)
-                save_training_plot(metrics_history, model_args.metrics_plot_path)
-            
-            # Evaluation
-            if step % model_args.eval_iters == 0 and step > 0:
-                print(f"\nEvaluating at step {step}...")
-                # Add eval logic here (call estimate_loss)
-            
-            # Checkpointing
             if step % model_args.save_checkpoint_iter == 0 and step > 0:
-                ckpt_path = f"checkpoint_{step}.pt"
-                torch.save({
-                    'model': base_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'args': model_args,
-                    'step': step
-                }, ckpt_path)
-                print(f"Saved checkpoint to {ckpt_path}")
+                print(f"Saving checkpoint at step {step}")
+                torch.save(base_model.state_dict(), f"checkpoint_{step}.pt")
+                
+            if step % model_args.eval_iters == 0 and step > 0:
+                val_loss = estimate_loss()
+                print(f"Validation Loss: {val_loss:.4f}")
+                wandb.log({"val_loss": val_loss})
 
     if use_ddp:
         cleanup_ddp()
