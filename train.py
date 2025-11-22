@@ -47,10 +47,8 @@ def train():
     args = get_args()
     model_args = ModelArgs()
     
-    # Tokenizer
     tokenizer = initialize_tokenizer(model_args.hf_token)
     
-    # DDP
     use_ddp = 'RANK' in os.environ or model_args.use_ddp
     if use_ddp:
         local_rank, world_size, rank, device = setup_ddp()
@@ -66,21 +64,20 @@ def train():
     if rank == 0:
         print(f"Training on {device} | World Size: {world_size}")
         print(f"Dataset: {model_args.dataset}")
-        print(f"Vocab Size: {model_args.vocab_size} (Llama-3)")
+        print(f"Vocab Size: {model_args.vocab_size}")
     
-    # Model
     model = DeepSeekV3(model_args).to(device)
     
     if use_ddp:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
     
     base_model = model.module if use_ddp else model
+    
     def amp_context():
         if device.type == "cuda":
             return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         return nullcontext()
 
-    # Optimizer Groups
     hidden_weights = []
     norm_bias_params = []
     non_hidden_params = []
@@ -108,21 +105,19 @@ def train():
             cleaned_group = {k: v for k, v in group.items() if k != "use_muon"}
             cleaned_groups.append(cleaned_group)
         optimizer = torch.optim.AdamW(cleaned_groups)
+        
     if hasattr(torch, "compile"):
         model = torch.compile(model)
     
-    # Data Loaders
     train_dataloader = prepare_dataset('train', device, model_args.batch_size, use_ddp=use_ddp, tokenizer=tokenizer, model_args=model_args)
     train_iterator = iter(train_dataloader)
     
-    # Create a separate iterator for validation (just grabbing a fresh batch from stream)
-    # Note: For strict validation, you'd want a separate held-out dataset shard.
     val_dataloader = prepare_dataset('val', device, model_args.batch_size, use_ddp=use_ddp, tokenizer=tokenizer, model_args=model_args)
     val_iterator = iter(val_dataloader)
+    
     train_history = []
     val_history = []
 
-    # Liger Loss Helper
     def compute_loss(output, targets, model_ref):
         if model_args.use_liger and hasattr(model_ref, 'le_loss'):
             decoder_out_flat = output.contiguous().view(-1, model_args.dim)
@@ -144,16 +139,16 @@ def train():
                 break
             idx, targets = batch['input_ids'].to(device), batch['labels'].to(device)
             with amp_context():
-                # We ignore aux loss during validation, just check perplexity
                 out = base_model(idx)
                 if model_args.use_liger and hasattr(base_model, 'le_loss'):
-                     # Liger returns loss directly if using fuse
-                     # But our model forward returns hidden states for liger
                      l = compute_loss(out, targets, base_model)
                 else:
                      l = compute_loss(out, targets, base_model)
             losses.append(l.item())
 
+        if not losses:
+            return 0.0
+            
         avg_loss = torch.tensor(losses).mean().to(device)
         if use_ddp:
             dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
@@ -164,11 +159,9 @@ def train():
     if rank == 0:
         pbar = tqdm.tqdm(range(model_args.total_iters))
     
-    token_count = 0
     accumulated_loss = 0.0
     
     for step in range(model_args.total_iters):
-        # LR Schedule
         lr = get_lr(step, model_args)
         for i in range(1, 3): optimizer.param_groups[i]['lr'] = lr
             
@@ -176,6 +169,12 @@ def train():
         accumulated_loss = 0.0
         
         for micro_step in range(model_args.gradient_accumulation_steps):
+            do_sync = (micro_step == model_args.gradient_accumulation_steps - 1)
+            if use_ddp and not do_sync:
+                context = model.no_sync()
+            else:
+                context = nullcontext()
+
             try:
                 batch = next(train_iterator)
             except StopIteration:
@@ -183,18 +182,20 @@ def train():
                 batch = next(train_iterator)
                 
             idx, targets = batch['input_ids'].to(device), batch['labels'].to(device)
-            token_count += idx.numel()
-            with amp_context():
-                output = model(idx)
-                ref_model = model.module if use_ddp else model
-                
-                cls_loss = compute_loss(output, targets, ref_model)
-                aux_loss = ref_model.last_aux_loss
-                
-                loss = cls_loss + (model_args.aux_loss_coef * aux_loss)
-                
-            loss = loss / model_args.gradient_accumulation_steps
-            loss.backward()
+            
+            with context:
+                with amp_context():
+                    output = model(idx)
+                    ref_model = model.module if use_ddp else model
+                    
+                    cls_loss = compute_loss(output, targets, ref_model)
+                    aux_loss = ref_model.last_aux_loss
+                    
+                    loss = cls_loss + (model_args.aux_loss_coef * aux_loss)
+                    loss = loss / model_args.gradient_accumulation_steps
+                    
+                loss.backward()
+            
             accumulated_loss += loss.item()
         
         if use_ddp:
@@ -213,8 +214,12 @@ def train():
             train_history.append((step, accumulated_loss))
             
             if step % model_args.save_checkpoint_iter == 0 and step > 0:
-                print(f"Saving checkpoint at step {step}")
-                torch.save(base_model.state_dict(), f"checkpoint_{step}.pt")
+                torch.save({
+                    'model': base_model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'step': step,
+                    'args': model_args
+                }, f"checkpoint_{step}.pt")
                 
             if step % model_args.eval_iters == 0 and step > 0:
                 val_loss = estimate_loss()
@@ -223,6 +228,7 @@ def train():
 
     if use_ddp:
         cleanup_ddp()
+        
     if rank == 0 and train_history:
         plt.figure()
         train_steps, train_losses = zip(*train_history)
